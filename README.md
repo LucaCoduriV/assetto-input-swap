@@ -1,4 +1,4 @@
-# InputSwap
+# Assetto Input Swap
 
 Switch Assetto Corsa between the gamepad and the wheel without leaving the session, even with a wheel
 plugged in after the game started. Personal local tool: nothing on the servers.

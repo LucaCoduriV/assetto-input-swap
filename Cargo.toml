@@ -1,5 +1,5 @@
 [package]
-name = "inputswap"
+name = "assetto-input-swap"
 version = "0.2.0"
 edition = "2021"
 description = "Switches Assetto Corsa to the wheel mid-session, even one plugged in after launch"
