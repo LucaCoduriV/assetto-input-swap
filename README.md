@@ -9,6 +9,10 @@ plugged in after the game started. Personal local tool: nothing on the servers.
 
 Both are ignored while the pause menu or the console is open. AC shows "Controls: Wheel" when it worked.
 
+Each switch also writes `INPUT_METHOD` in controls.ini's `[HEADER]` (`WHEEL` on Ctrl+W, `X360` on Ctrl+P;
+only that value changes), so whatever reads the file follows: a server HUD that labels records with it (the
+Touge Shobu HUD reads it when you connect and at each time attack start), and the next game start.
+
 ## How it works
 
 AC reads `Documents/Assetto Corsa/cfg/controls.ini` once, when the car loads (`CarAvatar::initControls`

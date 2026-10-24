@@ -32,7 +32,7 @@ use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE}
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_W};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_P, VK_W};
 use windows_sys::Win32::UI::Shell::{FOLDERID_Documents, SHGetKnownFolderPath};
 
 // ---- acs.exe 1.16 (RVAs and layouts from acs.pdb) -----------------------------------------------
@@ -305,21 +305,33 @@ pub unsafe extern "system" fn GetdfDIJoystick() -> *const c_void {
 type KeyFn = unsafe extern "C" fn(usize, *const u32);
 
 unsafe extern "C" fn on_key_down(keys: usize, event: *const u32) {
-    if *event == VK_W as u32 && key_down(VK_CONTROL) && switch_to_wheel(keys) {
+    let ctrl = key_down(VK_CONTROL);
+    if *event == VK_W as u32 && ctrl && switch_to_wheel(keys) {
         return;
     }
+    // AC's Ctrl+P switches to the gamepad under the same conditions (Sim::onKeyDown).
+    let gamepad = *event == VK_P as u32 && ctrl && shortcuts_allowed(keys);
     let original: KeyFn = std::mem::transmute(ORIGINAL_ON_KEY_DOWN.load(Ordering::SeqCst));
     original(keys, event);
+    if gamepad {
+        log("Ctrl+P (AC's own): gamepad");
+        set_input_method("X360");
+    }
+}
+
+/// AC takes its Ctrl shortcuts only while no blocking screen (pause menu) and no console is shown.
+unsafe fn shortcuts_allowed(keys: usize) -> bool {
+    let control_visible: unsafe extern "C" fn(usize) -> bool = acs_fn(CONTROL_IS_VISIBLE);
+    let console_visible: unsafe extern "C" fn(usize) -> bool = acs_fn(CONSOLE_IS_VISIBLE);
+    let screen = rd(keys + KEYS_BLOCKING_SCREEN);
+    let console = rd(keys + KEYS_CONSOLE);
+    !((screen != 0 && control_visible(screen)) || (console != 0 && console_visible(console)))
 }
 
 /// True when Ctrl+W was ours (handled, even if it failed), false to leave the key to AC.
 unsafe fn switch_to_wheel(keys: usize) -> bool {
     let acs = ACS.load(Ordering::Relaxed);
-    let control_visible: unsafe extern "C" fn(usize) -> bool = acs_fn(CONTROL_IS_VISIBLE);
-    let console_visible: unsafe extern "C" fn(usize) -> bool = acs_fn(CONSOLE_IS_VISIBLE);
-    let screen = rd(keys + KEYS_BLOCKING_SCREEN);
-    let console = rd(keys + KEYS_CONSOLE);
-    if (screen != 0 && control_visible(screen)) || (console != 0 && console_visible(console)) {
+    if !shortcuts_allowed(keys) {
         return false;
     }
     let cars = rd(keys + KEYS_CARS);
@@ -345,6 +357,7 @@ unsafe fn switch_to_wheel(keys: usize) -> bool {
         // A second DICarControl on the same wheel would lose its force feedback when AC deletes
         // the first one (on the physics thread, after the new one set its effects up).
         log("  already on the wheel, nothing new");
+        set_input_method("WHEEL");
         message(keys, "Controls", "Already on the wheel");
         return true;
     }
@@ -358,6 +371,7 @@ unsafe fn switch_to_wheel(keys: usize) -> bool {
     let set_provider: unsafe extern "C" fn(usize, usize) = acs_fn(SET_CONTROLS_PROVIDER);
     set_provider(avatar, provider);
     log(&format!("  wheel controls {provider:#x} queued for car {car:#x} (was {current:#x})"));
+    set_input_method("WHEEL");
     let text = if added.is_empty() { "Wheel".to_string() } else { format!("Wheel ({} found)", added.join(", ")) };
     message(keys, "Controls", &text);
     true
@@ -570,9 +584,74 @@ unsafe fn order_devices(di: usize, attached: &[Instance]) -> bool {
 
 // ---- controls.ini -------------------------------------------------------------------------------
 
+fn controls_ini() -> Option<std::path::PathBuf> {
+    documents().map(|d| d.join("Assetto Corsa").join("cfg").join("controls.ini"))
+}
+
+/// Writes [HEADER] INPUT_METHOD, so the file says which input the car uses now: scripts that read
+/// it (a server's HUD labels records with it) and the next game start follow the switch.
+fn set_input_method(value: &str) {
+    let Some(path) = controls_ini() else { return };
+    let Ok(bytes) = std::fs::read(&path) else {
+        log("  controls.ini not found: INPUT_METHOD not written");
+        return;
+    };
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        log("  controls.ini is UTF-16: INPUT_METHOD not written");
+        return;
+    }
+    let updated = with_input_method(&bytes, value);
+    if updated == bytes {
+        return;
+    }
+    let temp = path.with_extension("ini.inputswap");
+    match std::fs::write(&temp, &updated).and_then(|_| std::fs::rename(&temp, &path)) {
+        Ok(()) => log(&format!("  controls.ini: INPUT_METHOD={value}")),
+        Err(e) => log(&format!("  controls.ini: INPUT_METHOD not written ({e})")),
+    }
+}
+
+/// The ini with [HEADER] INPUT_METHOD set to `value`, every other byte as it was (the file may
+/// hold non-UTF-8 driver names). Adds the key, or the section, when missing.
+fn with_input_method(ini: &[u8], value: &str) -> Vec<u8> {
+    let newline: &[u8] = if ini.windows(2).any(|w| w == b"\r\n") { b"\r\n" } else { b"\n" };
+    let lines: Vec<&[u8]> = ini.split_inclusive(|&b| b == b'\n').collect();
+    let trimmed = |line: &[u8]| -> Vec<u8> { line.trim_ascii().to_ascii_uppercase() };
+    let Some(header) = lines.iter().position(|l| trimmed(l) == b"[HEADER]") else {
+        let mut out = [b"[HEADER]".as_slice(), newline, b"INPUT_METHOD=", value.as_bytes(), newline, newline].concat();
+        out.extend_from_slice(ini);
+        return out;
+    };
+    let section_end = (header + 1..lines.len()).find(|&i| trimmed(lines[i]).starts_with(b"[")).unwrap_or(lines.len());
+    let key = (header + 1..section_end).find(|&i| {
+        let t = trimmed(lines[i]);
+        t.split(|&b| b == b'=').next().map(|k| k.trim_ascii() == b"INPUT_METHOD").unwrap_or(false) && t.contains(&b'=')
+    });
+    let mut out = Vec::with_capacity(ini.len() + 32);
+    for (i, line) in lines.iter().enumerate() {
+        if Some(i) == key {
+            let ending: &[u8] = if line.ends_with(b"\r\n") { b"\r\n" } else if line.ends_with(b"\n") { b"\n" } else { b"" };
+            out.extend_from_slice(b"INPUT_METHOD=");
+            out.extend_from_slice(value.as_bytes());
+            out.extend_from_slice(ending);
+            continue;
+        }
+        out.extend_from_slice(line);
+        if i == header && key.is_none() {
+            if !line.ends_with(b"\n") {
+                out.extend_from_slice(newline);
+            }
+            out.extend_from_slice(b"INPUT_METHOD=");
+            out.extend_from_slice(value.as_bytes());
+            out.extend_from_slice(newline);
+        }
+    }
+    out
+}
+
 /// [CONTROLLERS] of Documents/Assetto Corsa/cfg/controls.ini: (__IGUIDn, PGUIDn) for n = 0, 1, …
 fn ini_controllers() -> Vec<(Option<Guid>, Option<Guid>)> {
-    let Some(text) = documents().and_then(|d| read_text(&d.join("Assetto Corsa").join("cfg").join("controls.ini"))) else {
+    let Some(text) = controls_ini().and_then(|p| read_text(&p)) else {
         log("  controls.ini not found: devices left in their order");
         return Vec::new();
     };
@@ -695,5 +774,21 @@ mod tests {
         assert_eq!(guid_text(&g), text);
         assert_eq!(parse_guid("{35AE76A0-4795-11EF-8001-444553540000}").map(|g| guid_text(&g)).as_deref(), Some("35AE76A0-4795-11EF-8001-444553540000"));
         assert!(parse_guid("nope").is_none());
+    }
+
+    #[test]
+    fn input_method_replaced_in_place() {
+        let ini = b"[CONTROLLERS]\r\nCON0=Pad \xe9\r\n\r\n[HEADER]\r\nINPUT_METHOD=X360\r\n\r\n[X360]\r\nINPUT_METHOD=nope\r\n";
+        let out = with_input_method(ini, "WHEEL");
+        assert_eq!(out, b"[CONTROLLERS]\r\nCON0=Pad \xe9\r\n\r\n[HEADER]\r\nINPUT_METHOD=WHEEL\r\n\r\n[X360]\r\nINPUT_METHOD=nope\r\n");
+        assert_eq!(with_input_method(&out, "WHEEL"), out);
+        assert_eq!(with_input_method(b"[HEADER]\nINPUT_METHOD = WHEEL ; comment\n", "X360"), b"[HEADER]\nINPUT_METHOD=X360\n");
+    }
+
+    #[test]
+    fn input_method_added_when_missing() {
+        assert_eq!(with_input_method(b"[HEADER]\r\nOTHER=1\r\n", "X360"), b"[HEADER]\r\nINPUT_METHOD=X360\r\nOTHER=1\r\n");
+        assert_eq!(with_input_method(b"[HEADER]", "X360"), b"[HEADER]\nINPUT_METHOD=X360\n");
+        assert_eq!(with_input_method(b"[STEER]\r\nJOY=1\r\n", "WHEEL"), b"[HEADER]\r\nINPUT_METHOD=WHEEL\r\n\r\n[STEER]\r\nJOY=1\r\n");
     }
 }
